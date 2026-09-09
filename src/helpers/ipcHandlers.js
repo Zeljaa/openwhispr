@@ -4,6 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 const debugLogger = require("./debugLogger");
+const { ANALYTICS_HISTORY_BACKFILL_VERSION } = require("./analytics");
 const { PARAKEET_UNSUPPORTED_OS_CODE } = require("./parakeetCapability");
 const { getModelType, isSherpaLocalProvider } = require("./parakeetModelInfo");
 const { broadcastToWindows } = require("./windowBroadcast");
@@ -652,11 +653,6 @@ class IPCHandlers {
     this._noteFilesEnabled = false;
     this._granolaImportPending = null;
     this._analyticsHistoryBackfillPromise = null;
-    // Cleared by every write that can leave a completed transcription with no
-    // analytics event: a retry that lands, a transcription pulled from the
-    // cloud, and a live analytics write that threw. Missing one is this
-    // checkpoint's failure mode, so the sites are counted by a test.
-    this._analyticsHistoryBackfilled = false;
     this.speakerDiarizationEnabled = true;
     this.activeMeetingSpeakerConfig = null;
     this.whisperVadSettings = {
@@ -715,13 +711,6 @@ class IPCHandlers {
   // Insights summary that SQLite could have answered perfectly well.
   async _ensureAnalyticsHistoryBackfilled() {
     if (this._analyticsHistoryBackfillPromise) return this._analyticsHistoryBackfillPromise;
-    if (this._analyticsHistoryBackfilled) return { inserted: 0, scanned: 0 };
-    // Set before the scan, not after it: a write that lands mid-pass clears it
-    // again, so the next read reconciles rather than trusting a scan that may
-    // have already read past the row that changed. Without it every analytics
-    // read re-walks the whole transcriptions table -- including each turn of
-    // AnalyticsService's upload loop, which reads pending events per batch.
-    this._analyticsHistoryBackfilled = true;
     // The failure is absorbed inside this promise rather than around the
     // creator's await, because callers that join an in-flight pass are handed
     // this promise directly and would otherwise receive the raw rejection --
@@ -731,14 +720,22 @@ class IPCHandlers {
       let inserted = 0;
       let scanned = 0;
       let skipped = 0;
-      let afterId = 0;
+      const state = this.databaseManager.getAnalyticsHistoryBackfillState(
+        ANALYTICS_HISTORY_BACKFILL_VERSION
+      );
+      if (state.scannedThroughId >= state.targetId) return { inserted, scanned };
       while (true) {
-        const batch = this.databaseManager.backfillAnalyticsHistoryBatch({ afterId });
+        // The database reads its persisted cursor again for every batch. An
+        // older row made eligible while this pass yields can move that cursor
+        // backward without being overwritten by stale in-memory progress.
+        const batch = this.databaseManager.backfillAnalyticsHistoryBatch({
+          throughId: state.targetId,
+          checkpointVersion: ANALYTICS_HISTORY_BACKFILL_VERSION,
+        });
         inserted += batch.inserted;
         scanned += batch.scanned;
         skipped += batch.skipped;
         if (batch.complete) break;
-        afterId = batch.nextCursor;
         await new Promise((resolve) => setImmediate(resolve));
       }
       if (inserted > 0) broadcastToWindows("analytics-changed");
@@ -752,7 +749,6 @@ class IPCHandlers {
       return { inserted, scanned };
     })().catch((error) => {
       debugLogger.error("Analytics history backfill failed", { error: error.message }, "analytics");
-      this._analyticsHistoryBackfilled = false;
       return { inserted: 0, scanned: 0 };
     });
     this._analyticsHistoryBackfillPromise = backfillPromise;
@@ -1519,13 +1515,7 @@ class IPCHandlers {
       // The renderer only warns when this write fails, then saves the
       // transcription as completed anyway -- leaving a row the backfill is
       // the only thing that will ever reconcile.
-      let result;
-      try {
-        result = this.databaseManager.recordAnalyticsEvent(input);
-      } catch (error) {
-        this._analyticsHistoryBackfilled = false;
-        throw error;
-      }
+      const result = this.databaseManager.recordAnalyticsEvent(input);
       // Dictation and the control panel are separate renderers, so the
       // Insights view can only learn about a new event through the main process.
       if (result?.success && !result.ignored) {
@@ -2643,10 +2633,6 @@ class IPCHandlers {
       this.databaseManager.getTranscriptionByClientId(clientId)
     );
     ipcMain.handle("db-upsert-transcription-from-cloud", (_, cloudTranscription) => {
-      // Pulled history predates this device's analytics events, and the upsert
-      // can also flip an existing row to completed. Left to the next analytics
-      // read rather than started here: a pull arrives one row at a time.
-      this._analyticsHistoryBackfilled = false;
       return this.databaseManager.upsertTranscriptionFromCloud(cloudTranscription);
     });
     ipcMain.handle("db-mark-transcription-synced", (_, id, cloudId) =>
@@ -6464,7 +6450,6 @@ class IPCHandlers {
           setImmediate(() => {
             broadcastToWindows("transcription-updated", updated);
             // A row that just reached "completed" is newly eligible.
-            this._analyticsHistoryBackfilled = false;
             void this._ensureAnalyticsHistoryBackfilled();
           });
         }

@@ -390,6 +390,37 @@ for (const [name, daily] of [
   });
 }
 
+test("a malformed successful summary does not retrigger server history", async (t) => {
+  const requests = [];
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        cloudApiRequest: async (request) => {
+          requests.push(request);
+          return requests.length === 1
+            ? { success: true, data: { ...VALID_SUMMARY, daily: [null] } }
+            : { success: true, data: VALID_SUMMARY };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { getAccountAnalyticsSummary } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  await assert.rejects(
+    getAccountAnalyticsSummary("malformed-account"),
+    /Malformed analytics summary from cloud/
+  );
+  await getAccountAnalyticsSummary("malformed-account");
+
+  assert.deepEqual(
+    requests.map((request) =>
+      new URL(request.path, "https://api.openwhispr.com").searchParams.get("backfill")
+    ),
+    ["true", null]
+  );
+});
+
 test("analytics refreshes locally on change and remotely only while cloud Insights are active", async (t) => {
   const windowListeners = new Map();
   const documentListeners = new Map();

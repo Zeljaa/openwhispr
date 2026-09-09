@@ -14,11 +14,22 @@ function completeBatch(overrides = {}) {
   };
 }
 
-function createContext(backfillAnalyticsHistoryBatch) {
+function createContext(backfillAnalyticsHistoryBatch, targetId = 10) {
+  const state = { scannedThroughId: 0, targetId };
   return Object.assign(Object.create(IPCHandlers.prototype), {
-    databaseManager: { backfillAnalyticsHistoryBatch },
+    databaseManager: {
+      getAnalyticsHistoryBackfillState: () => ({ version: 1, ...state }),
+      backfillAnalyticsHistoryBatch: (options) => {
+        const result = backfillAnalyticsHistoryBatch({
+          ...options,
+          afterId: state.scannedThroughId,
+        });
+        state.scannedThroughId = result.complete ? state.targetId : result.nextCursor;
+        return result;
+      },
+    },
     _analyticsHistoryBackfillPromise: null,
-    _analyticsHistoryBackfilled: false,
+    analyticsHistoryBackfillState: state,
   });
 }
 
@@ -27,29 +38,26 @@ test("a failed history pass is absorbed and remains retryable", async () => {
   const context = createContext(() => {
     attempts += 1;
     if (attempts === 1) throw new Error("broken history row");
-    return completeBatch();
-  });
+    return completeBatch({ nextCursor: 1 });
+  }, 1);
 
   assert.deepEqual(await context._ensureAnalyticsHistoryBackfilled(), {
     inserted: 0,
     scanned: 0,
   });
-  assert.equal(context._analyticsHistoryBackfilled, false);
-
   assert.deepEqual(await context._ensureAnalyticsHistoryBackfilled(), {
     inserted: 0,
     scanned: 0,
   });
   assert.equal(attempts, 2);
-  assert.equal(context._analyticsHistoryBackfilled, true);
 });
 
-test("concurrent readers share one pass and completed history is memoized", async () => {
+test("concurrent readers share one pass and completed history stays checkpointed", async () => {
   let calls = 0;
   const context = createContext(({ afterId }) => {
     calls += 1;
     return afterId === 0
-      ? completeBatch({ complete: false, nextCursor: 10, scanned: 1 })
+      ? completeBatch({ complete: false, nextCursor: 5, scanned: 1 })
       : completeBatch({ nextCursor: 10, scanned: 1 });
   });
 
@@ -68,20 +76,20 @@ test("concurrent readers share one pass and completed history is memoized", asyn
   assert.equal(calls, 2, "a completed pass must short-circuit later reads");
 });
 
-test("a write that invalidates an in-flight pass remains visible to the next read", async () => {
+test("an in-flight pass rereads a durable cursor that moves backward", async () => {
   let calls = 0;
+  const starts = [];
   const context = createContext(({ afterId }) => {
     calls += 1;
-    return afterId === 0
-      ? completeBatch({ complete: false, nextCursor: 10, scanned: 1 })
+    starts.push(afterId);
+    return afterId < 5
+      ? completeBatch({ complete: false, nextCursor: 5, scanned: 1 })
       : completeBatch({ nextCursor: 10, scanned: 1 });
   });
 
   const inFlight = context._ensureAnalyticsHistoryBackfilled();
-  context._analyticsHistoryBackfilled = false;
+  context.analyticsHistoryBackfillState.scannedThroughId = 0;
   await inFlight;
-  assert.equal(context._analyticsHistoryBackfilled, false);
-
-  await context._ensureAnalyticsHistoryBackfilled();
-  assert.equal(calls, 4, "the invalidating write must cause another complete pass");
+  assert.equal(calls, 3, "the regressed cursor must be revisited before the pass completes");
+  assert.deepEqual(starts, [0, 0, 5]);
 });

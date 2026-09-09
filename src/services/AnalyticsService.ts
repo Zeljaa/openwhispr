@@ -307,15 +307,9 @@ export async function getAccountAnalyticsSummary(
   });
   if (requestHistoryBackfill) params.set("backfill", "true");
 
+  let summary: unknown;
   try {
-    const summary = await cloudGet<unknown>(`/api/analytics/summary?${params}`);
-    // The cloud is an untrusted JSON boundary. Invalid buckets crash Heatmap
-    // during render, outside the caller's async fallback, so validate the whole
-    // shape before any part of it reaches component state.
-    if (!isAnalyticsSummary(summary)) {
-      throw new Error("Malformed analytics summary from cloud");
-    }
-    return summary;
+    summary = await cloudGet<unknown>(`/api/analytics/summary?${params}`);
   } catch (error) {
     // A transient first request must not permanently suppress reconciliation.
     // The Set is claimed before I/O so overlapping refreshes still collapse to
@@ -323,4 +317,13 @@ export async function getAccountAnalyticsSummary(
     if (requestHistoryBackfill && accountId) requestedHistoryBackfillAccounts.delete(accountId);
     throw error;
   }
+  // The cloud is an untrusted JSON boundary. Invalid buckets crash Heatmap
+  // during render, outside the caller's async fallback, so validate the whole
+  // shape before any part of it reaches component state. A successful request
+  // already triggered history reconciliation; malformed presentation data
+  // must not start another continuation chain on the next refresh.
+  if (!isAnalyticsSummary(summary)) {
+    throw new Error("Malformed analytics summary from cloud");
+  }
+  return summary;
 }

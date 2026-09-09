@@ -8,6 +8,7 @@ const { normalizeStoredSpeakerCount } = require("./speakerCount");
 const { parseEventTime } = require("./calendarAvailability");
 const {
   ANALYTICS_COUNTER_VERSION,
+  ANALYTICS_HISTORY_BACKFILL_VERSION,
   ANALYTICS_HISTORICAL_COUNTER_VERSION,
   countSpokenWords,
   inferHistoricalAnalyticsMode,
@@ -1016,6 +1017,12 @@ class DatabaseManager {
           id INTEGER PRIMARY KEY CHECK (id = 1),
           cleared_through TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS analytics_history_backfill_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          version INTEGER NOT NULL,
+          scanned_through_transcription_id INTEGER NOT NULL DEFAULT 0
+            CHECK (scanned_through_transcription_id >= 0)
+        );
       `);
       // Repair databases created before analytics deletion tombstones were
       // introduced. SQLite has no ADD COLUMN IF NOT EXISTS syntax.
@@ -1336,69 +1343,169 @@ class DatabaseManager {
     }
   }
 
-  backfillAnalyticsHistoryBatch({ afterId = 0, limit = 250 } = {}) {
+  _ensureAnalyticsHistoryBackfillState(version) {
+    this.db
+      .prepare(
+        `INSERT INTO analytics_history_backfill_state (
+           id, version, scanned_through_transcription_id
+         ) VALUES (1, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           version = excluded.version,
+           scanned_through_transcription_id = 0
+         WHERE analytics_history_backfill_state.version <> excluded.version`
+      )
+      .run(version);
+    return this.db
+      .prepare(
+        `SELECT version, scanned_through_transcription_id
+         FROM analytics_history_backfill_state WHERE id = 1`
+      )
+      .get();
+  }
+
+  getAnalyticsHistoryBackfillState(version = ANALYTICS_HISTORY_BACKFILL_VERSION) {
+    try {
+      if (!this.db) throw new Error("Database not initialized");
+      const safeVersion = Math.max(1, Math.trunc(Number(version)) || 1);
+      return this.db.transaction(() => {
+        const state = this._ensureAnalyticsHistoryBackfillState(safeVersion);
+        const target = this.db
+          .prepare("SELECT COALESCE(MAX(id), 0) AS id FROM transcriptions")
+          .get();
+        return {
+          version: safeVersion,
+          scannedThroughId: Number(state.scanned_through_transcription_id),
+          targetId: Number(target.id),
+        };
+      })();
+    } catch (error) {
+      debugLogger.error(
+        "Error reading analytics history backfill state",
+        { error: error.message },
+        "database"
+      );
+      throw error;
+    }
+  }
+
+  _invalidateAnalyticsHistoryFromTranscription(id) {
+    const resumeBeforeId = Math.max(0, Math.trunc(Number(id)) - 1);
+    this.db
+      .prepare(
+        `INSERT INTO analytics_history_backfill_state (
+           id, version, scanned_through_transcription_id
+         ) VALUES (1, ?, 0)
+         ON CONFLICT(id) DO UPDATE SET
+           version = excluded.version,
+           scanned_through_transcription_id = CASE
+             WHEN analytics_history_backfill_state.version = excluded.version
+             THEN MIN(
+               analytics_history_backfill_state.scanned_through_transcription_id,
+               ?
+             )
+             ELSE 0
+           END`
+      )
+      .run(ANALYTICS_HISTORY_BACKFILL_VERSION, resumeBeforeId);
+  }
+
+  backfillAnalyticsHistoryBatch({
+    afterId = 0,
+    throughId = null,
+    checkpointVersion = null,
+    limit = 250,
+  } = {}) {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const safeLimit = Math.max(1, Math.min(Math.trunc(Number(limit)) || 250, 1_000));
       const safeAfterId = Math.max(0, Math.trunc(Number(afterId)) || 0);
-      const clearState = this.db
-        .prepare("SELECT cleared_through FROM analytics_device_clear_state WHERE id = 1")
-        .get();
-      // Legacy SQLite timestamps are completion times without an offset. Once
-      // the user has cleared Insights, only a client-captured occurrence time
-      // can prove that a historical row happened afterward, so an ambiguous
-      // legacy row stays out rather than reviving a cleared counter. That is
-      // the eligibility rule below; the boundary on the instant actually
-      // written is enforced in the loop, where the chosen value is known.
-      const rows = this.db
-        .prepare(
-          `SELECT transcription.id, transcription.client_transcription_id,
-                  transcription.text, transcription.raw_text, transcription.timestamp,
-                  transcription.created_at,
-                  audio_duration_ms, provider, model
-           FROM transcriptions transcription
-           WHERE transcription.id > ?
-             AND transcription.deleted_at IS NULL
-             AND transcription.status = 'completed'
-             AND TRIM(COALESCE(NULLIF(TRIM(transcription.raw_text), ''), transcription.text, '')) != ''
-             AND NOT EXISTS (
-               SELECT 1 FROM analytics_events event
-               WHERE event.event_id = TRIM(transcription.client_transcription_id)
-             )
-             AND (
-               ? IS NULL
-               OR (
-                 (TRIM(transcription.timestamp) LIKE '%Z'
-                  OR SUBSTR(TRIM(transcription.timestamp), -6, 1) IN ('+', '-'))
-                 AND JULIANDAY(transcription.timestamp) > JULIANDAY(?)
+      const safeThroughId =
+        throughId === null || throughId === undefined
+          ? null
+          : Math.max(0, Math.trunc(Number(throughId)) || 0);
+      const safeCheckpointVersion =
+        checkpointVersion === null || checkpointVersion === undefined
+          ? null
+          : Math.max(1, Math.trunc(Number(checkpointVersion)) || 1);
+
+      return this.db.transaction(() => {
+        const checkpoint =
+          safeCheckpointVersion === null
+            ? null
+            : this._ensureAnalyticsHistoryBackfillState(safeCheckpointVersion);
+        const effectiveAfterId = checkpoint
+          ? Number(checkpoint.scanned_through_transcription_id)
+          : safeAfterId;
+        if (safeThroughId !== null && effectiveAfterId >= safeThroughId) {
+          return {
+            complete: true,
+            nextCursor: effectiveAfterId,
+            scanned: 0,
+            inserted: 0,
+            skipped: 0,
+          };
+        }
+
+        const clearState = this.db
+          .prepare("SELECT cleared_through FROM analytics_device_clear_state WHERE id = 1")
+          .get();
+        // Legacy SQLite timestamps are completion times without an offset. Once
+        // the user has cleared Insights, only a client-captured occurrence time
+        // can prove that a historical row happened afterward, so an ambiguous
+        // legacy row stays out rather than reviving a cleared counter. That is
+        // the eligibility rule below; the boundary on the instant actually
+        // written is enforced in the loop, where the chosen value is known.
+        const rows = this.db
+          .prepare(
+            `SELECT transcription.id, transcription.client_transcription_id,
+                    transcription.text, transcription.raw_text, transcription.timestamp,
+                    transcription.created_at,
+                    audio_duration_ms, provider, model
+             FROM transcriptions transcription
+             WHERE transcription.id > ?
+               AND (? IS NULL OR transcription.id <= ?)
+               AND transcription.deleted_at IS NULL
+               AND transcription.status = 'completed'
+               AND TRIM(COALESCE(NULLIF(TRIM(transcription.raw_text), ''), transcription.text, '')) != ''
+               AND NOT EXISTS (
+                 SELECT 1 FROM analytics_events event
+                 WHERE event.event_id = TRIM(transcription.client_transcription_id)
                )
-             )
-           ORDER BY transcription.id ASC
-           LIMIT ?`
-        )
-        .all(
-          safeAfterId,
-          clearState?.cleared_through ?? null,
-          clearState?.cleared_through ?? null,
-          safeLimit
+               AND (
+                 ? IS NULL
+                 OR (
+                   (TRIM(transcription.timestamp) LIKE '%Z'
+                    OR SUBSTR(TRIM(transcription.timestamp), -6, 1) IN ('+', '-'))
+                   AND JULIANDAY(transcription.timestamp) > JULIANDAY(?)
+                 )
+               )
+             ORDER BY transcription.id ASC
+             LIMIT ?`
+          )
+          .all(
+            effectiveAfterId,
+            safeThroughId,
+            safeThroughId,
+            clearState?.cleared_through ?? null,
+            clearState?.cleared_through ?? null,
+            safeLimit
+          );
+
+        let inserted = 0;
+        let skipped = 0;
+        const clearedThrough = clearState ? Date.parse(clearState.cleared_through) : null;
+        const insert = this.db.prepare(
+          `INSERT INTO analytics_events (
+             event_id, account_id, occurred_at, local_date, word_count,
+             spoken_duration_ms, mode, provider, model, counter_version, created_at
+           ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME(?))
+           ON CONFLICT(event_id) DO NOTHING`
+        );
+        const assignClientId = this.db.prepare(
+          `UPDATE transcriptions SET client_transcription_id = ?
+           WHERE id = ? AND (client_transcription_id IS NULL OR TRIM(client_transcription_id) = '')`
         );
 
-      let inserted = 0;
-      let skipped = 0;
-      const clearedThrough = clearState ? Date.parse(clearState.cleared_through) : null;
-      const insert = this.db.prepare(
-        `INSERT INTO analytics_events (
-           event_id, account_id, occurred_at, local_date, word_count,
-           spoken_duration_ms, mode, provider, model, counter_version, created_at
-         ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME(?))
-         ON CONFLICT(event_id) DO NOTHING`
-      );
-      const assignClientId = this.db.prepare(
-        `UPDATE transcriptions SET client_transcription_id = ?
-         WHERE id = ? AND (client_transcription_id IS NULL OR TRIM(client_transcription_id) = '')`
-      );
-
-      const writeBatch = this.db.transaction(() => {
         for (const row of rows) {
           const sourceText = row.raw_text?.trim() ? row.raw_text : row.text;
           const wordCount = countSpokenWords(sourceText);
@@ -1449,16 +1556,29 @@ class DatabaseManager {
           if (result.changes > 0) inserted += 1;
           else skipped += 1;
         }
-      });
-      writeBatch();
 
-      return {
-        complete: rows.length < safeLimit,
-        nextCursor: rows.length > 0 ? Number(rows[rows.length - 1].id) : safeAfterId,
-        scanned: rows.length,
-        inserted,
-        skipped,
-      };
+        const complete = rows.length < safeLimit;
+        const lastCandidateId =
+          rows.length > 0 ? Number(rows[rows.length - 1].id) : effectiveAfterId;
+        const nextCursor = complete && safeThroughId !== null ? safeThroughId : lastCandidateId;
+        if (checkpoint) {
+          this.db
+            .prepare(
+              `UPDATE analytics_history_backfill_state
+               SET scanned_through_transcription_id = ?
+               WHERE id = 1 AND version = ?`
+            )
+            .run(nextCursor, safeCheckpointVersion);
+        }
+
+        return {
+          complete,
+          nextCursor,
+          scanned: rows.length,
+          inserted,
+          skipped,
+        };
+      })();
     } catch (error) {
       debugLogger.error(
         "Error backfilling analytics history",
@@ -1949,7 +2069,15 @@ class DatabaseManager {
     try {
       if (!this.db) throw new Error("Database not initialized");
       const stmt = this.db.prepare("UPDATE transcriptions SET text = ?, raw_text = ? WHERE id = ?");
-      stmt.run(text, rawText, id);
+      this.db.transaction(() => {
+        const existing = this.db
+          .prepare("SELECT text, raw_text FROM transcriptions WHERE id = ?")
+          .get(id);
+        if (existing && (existing.text !== text || existing.raw_text !== rawText)) {
+          this._invalidateAnalyticsHistoryFromTranscription(id);
+        }
+        stmt.run(text, rawText, id);
+      })();
       return { success: true };
     } catch (error) {
       debugLogger.error("Error updating transcription text", { error: error.message }, "database");
@@ -1963,7 +2091,13 @@ class DatabaseManager {
       const stmt = this.db.prepare(
         "UPDATE transcriptions SET status = ?, error_message = ?, error_code = ? WHERE id = ?"
       );
-      stmt.run(status, errorMessage, errorCode, id);
+      this.db.transaction(() => {
+        const existing = this.db.prepare("SELECT status FROM transcriptions WHERE id = ?").get(id);
+        if (existing && existing.status !== status && status === "completed") {
+          this._invalidateAnalyticsHistoryFromTranscription(id);
+        }
+        stmt.run(status, errorMessage, errorCode, id);
+      })();
       return { success: true };
     } catch (error) {
       debugLogger.error(
@@ -6789,6 +6923,9 @@ class DatabaseManager {
   upsertTranscriptionFromCloud(cloudTranscription) {
     try {
       if (!this.db) throw new Error("Database not initialized");
+      const text = cloudTranscription.text ?? "";
+      const rawText = cloudTranscription.raw_text || null;
+      const status = cloudTranscription.status || "completed";
       const stmt = this.db.prepare(`
         INSERT INTO transcriptions (client_transcription_id, cloud_id, text, raw_text, status, sync_status, created_at)
         VALUES (?, ?, ?, ?, ?, 'synced', ?)
@@ -6799,17 +6936,31 @@ class DatabaseManager {
           status = excluded.status,
           sync_status = 'synced'
       `);
-      stmt.run(
-        cloudTranscription.client_transcription_id,
-        cloudTranscription.id,
-        cloudTranscription.text ?? "",
-        cloudTranscription.raw_text || null,
-        cloudTranscription.status || "completed",
-        cloudTranscription.created_at
-      );
-      return this.db
-        .prepare("SELECT * FROM transcriptions WHERE client_transcription_id = ?")
-        .get(cloudTranscription.client_transcription_id);
+      return this.db.transaction(() => {
+        const existing = this.db
+          .prepare(
+            `SELECT id, text, raw_text, status FROM transcriptions
+             WHERE client_transcription_id = ?`
+          )
+          .get(cloudTranscription.client_transcription_id);
+        if (
+          existing &&
+          (existing.text !== text || existing.raw_text !== rawText || existing.status !== status)
+        ) {
+          this._invalidateAnalyticsHistoryFromTranscription(existing.id);
+        }
+        stmt.run(
+          cloudTranscription.client_transcription_id,
+          cloudTranscription.id,
+          text,
+          rawText,
+          status,
+          cloudTranscription.created_at
+        );
+        return this.db
+          .prepare("SELECT * FROM transcriptions WHERE client_transcription_id = ?")
+          .get(cloudTranscription.client_transcription_id);
+      })();
     } catch (error) {
       debugLogger.error(
         "Error upserting transcription from cloud",
