@@ -217,11 +217,13 @@ function MetricCard({
 }
 
 function YourUsage({
+  accountId,
   dataRetentionEnabled,
   isLoaded,
   onSyncErrorChange,
   syncActive,
 }: {
+  accountId: string | null;
   dataRetentionEnabled: boolean;
   isLoaded: boolean;
   onSyncErrorChange: (error: boolean) => void;
@@ -265,7 +267,7 @@ function YourUsage({
         if (!(await syncService.syncAnalyticsNow())) {
           throw new Error("Insights uploads are not enabled for this account");
         }
-        const account = await getAccountAnalyticsSummary();
+        const account = await getAccountAnalyticsSummary(accountId);
         if (requestId !== requestIdRef.current) return;
         setSummary(account);
       } else {
@@ -279,7 +281,7 @@ function YourUsage({
     } finally {
       if (requestId === requestIdRef.current) setLoading(false);
     }
-  }, [isLoaded, syncActive]);
+  }, [accountId, isLoaded, syncActive]);
 
   useEffect(() => subscribeToAnalyticsRefresh(load, syncActive), [load, syncActive]);
 
@@ -390,7 +392,7 @@ function YourUsage({
 
 export default function InsightsView({ onSignIn, onInvite }: InsightsViewProps) {
   const { t } = useTranslation();
-  const { isLoaded, isSignedIn } = useAuth();
+  const { isLoaded, isSignedIn, user } = useAuth();
   const { dataRetentionEnabled: personalDataRetentionEnabled, insightsSyncEnabled } = useSettings();
   const dataRetentionEnabled = usePolicyStore((policyState) =>
     effectiveLocalHistoryEnabled(policyState, personalDataRetentionEnabled)
@@ -479,6 +481,7 @@ export default function InsightsView({ onSignIn, onInvite }: InsightsViewProps) 
 
         <TabsContent value="usage" className="mt-6">
           <YourUsage
+            accountId={user?.id ?? null}
             dataRetentionEnabled={dataRetentionEnabled}
             isLoaded={isLoaded}
             onSyncErrorChange={setSyncError}

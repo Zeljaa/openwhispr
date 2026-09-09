@@ -300,6 +300,69 @@ test("account analytics sends UTC when the runtime exposes no timezone", async (
   assert.equal(requestUrl.searchParams.get("timeZone"), "UTC");
 });
 
+test("account analytics requests history once per account and not on ordinary refreshes", async (t) => {
+  const requests = [];
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        cloudApiRequest: async (request) => {
+          requests.push(request);
+          return {
+            success: true,
+            data: { ...VALID_SUMMARY, scope: "account", timeZone: "UTC" },
+          };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { getAccountAnalyticsSummary } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  await getAccountAnalyticsSummary("account-a");
+  await getAccountAnalyticsSummary("account-a");
+  await getAccountAnalyticsSummary("account-b");
+  await getAccountAnalyticsSummary();
+
+  assert.deepEqual(
+    requests.map((request) =>
+      new URL(request.path, "https://api.openwhispr.com").searchParams.get("backfill")
+    ),
+    ["true", null, "true", null]
+  );
+});
+
+test("account analytics retries the history trigger after a failed request", async (t) => {
+  const requests = [];
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        cloudApiRequest: async (request) => {
+          requests.push(request);
+          if (requests.length === 1) {
+            return { success: false, status: 503, error: "temporarily unavailable" };
+          }
+          return {
+            success: true,
+            data: { ...VALID_SUMMARY, scope: "account", timeZone: "UTC" },
+          };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { getAccountAnalyticsSummary } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  await assert.rejects(getAccountAnalyticsSummary("retry-account"));
+  await getAccountAnalyticsSummary("retry-account");
+
+  assert.deepEqual(
+    requests.map((request) =>
+      new URL(request.path, "https://api.openwhispr.com").searchParams.get("backfill")
+    ),
+    ["true", "true"]
+  );
+});
+
 for (const [name, daily] of [
   ["a null bucket", [null]],
   ["an impossible date", [{ ...VALID_SUMMARY.daily[0], date: "2026-02-30" }]],

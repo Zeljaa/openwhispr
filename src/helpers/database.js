@@ -8,6 +8,7 @@ const { normalizeStoredSpeakerCount } = require("./speakerCount");
 const { parseEventTime } = require("./calendarAvailability");
 const {
   ANALYTICS_COUNTER_VERSION,
+  ANALYTICS_HISTORICAL_COUNTER_VERSION,
   countSpokenWords,
   inferHistoricalAnalyticsMode,
   localDateKey,
@@ -1442,7 +1443,7 @@ class DatabaseManager {
             inferHistoricalAnalyticsMode(row.provider),
             row.provider || null,
             row.model || null,
-            ANALYTICS_COUNTER_VERSION,
+            ANALYTICS_HISTORICAL_COUNTER_VERSION,
             (createdAt ?? occurredAt).toISOString()
           );
           if (result.changes > 0) inserted += 1;

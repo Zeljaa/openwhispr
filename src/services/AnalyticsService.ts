@@ -4,6 +4,7 @@ import type { AnalyticsSummary, PendingAnalyticsEvent } from "../types/electron"
 const BATCH_SIZE = 200;
 export const ANALYTICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const ANALYTICS_REMOTE_REFRESH_DEBOUNCE_MS = 250;
+const requestedHistoryBackfillAccounts = new Set<string>();
 
 export function subscribeToAnalyticsRefresh(
   refresh: () => void | Promise<void>,
@@ -245,16 +246,32 @@ function isAnalyticsSummary(value: unknown): value is AnalyticsSummary {
   );
 }
 
-export async function getAccountAnalyticsSummary(): Promise<AnalyticsSummary> {
+export async function getAccountAnalyticsSummary(
+  accountId: string | null = null
+): Promise<AnalyticsSummary> {
+  const requestHistoryBackfill = Boolean(
+    accountId && !requestedHistoryBackfillAccounts.has(accountId)
+  );
+  if (requestHistoryBackfill && accountId) requestedHistoryBackfillAccounts.add(accountId);
   const params = new URLSearchParams({
     timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
   });
-  const summary = await cloudGet<unknown>(`/api/analytics/summary?${params}`);
-  // The cloud is an untrusted JSON boundary. Invalid buckets crash Heatmap
-  // during render, outside the caller's async fallback, so validate the whole
-  // shape before any part of it reaches component state.
-  if (!isAnalyticsSummary(summary)) {
-    throw new Error("Malformed analytics summary from cloud");
+  if (requestHistoryBackfill) params.set("backfill", "true");
+
+  try {
+    const summary = await cloudGet<unknown>(`/api/analytics/summary?${params}`);
+    // The cloud is an untrusted JSON boundary. Invalid buckets crash Heatmap
+    // during render, outside the caller's async fallback, so validate the whole
+    // shape before any part of it reaches component state.
+    if (!isAnalyticsSummary(summary)) {
+      throw new Error("Malformed analytics summary from cloud");
+    }
+    return summary;
+  } catch (error) {
+    // A transient first request must not permanently suppress reconciliation.
+    // The Set is claimed before I/O so overlapping refreshes still collapse to
+    // one trigger for this account and renderer process.
+    if (requestHistoryBackfill && accountId) requestedHistoryBackfillAccounts.delete(accountId);
+    throw error;
   }
-  return summary;
 }

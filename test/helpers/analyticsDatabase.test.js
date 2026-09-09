@@ -170,7 +170,7 @@ test("historical transcriptions reconcile in restart-safe account-neutral batche
         word_count: 2,
         spoken_duration_ms: null,
         mode: "unknown",
-        counter_version: 2,
+        counter_version: 0,
         created_at: "2026-09-02 10:00:00",
       },
       {
@@ -179,7 +179,7 @@ test("historical transcriptions reconcile in restart-safe account-neutral batche
         word_count: 3,
         spoken_duration_ms: 2_000,
         mode: "local",
-        counter_version: 2,
+        counter_version: 0,
         created_at: "2026-09-01 10:00:00",
       },
     ]
