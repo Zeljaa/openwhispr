@@ -837,6 +837,53 @@ test("revoking upload consent stops a multi-batch drain after its active request
   assert.equal(retired.has("event-200"), false, "the next batch stays pending after revocation");
 });
 
+test("a history backlog is capped per pass and drains across later passes", async (t) => {
+  // Insights waits on a pass before it can read the account summary, so an
+  // unbounded drain held the view's spinner — and hammered the batch endpoint —
+  // for as long as a whole reconstructed history took to upload.
+  const pending = Array.from({ length: 1400 }, (_, index) => ({
+    ...EVENT,
+    event_id: `event-${index}`,
+    counter_version: 0,
+  }));
+  const retired = new Set();
+  const posted = [];
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        getPendingAnalyticsClear: async () => null,
+        getPendingAnalyticsDeletes: async () => [],
+        getPendingAnalyticsEvents: async (limit) =>
+          pending.filter((event) => !retired.has(event.event_id)).slice(0, limit),
+        markAnalyticsEventsSynced: async (eventIds) => {
+          eventIds.forEach((eventId) => retired.add(eventId));
+          return { success: true, updated: eventIds.length };
+        },
+        cloudApiRequest: async (request) => {
+          posted.push(request.body.events.length);
+          return {
+            success: true,
+            data: {
+              accepted: request.body.events.map((event) => event.event_id),
+              supportsHistoricalCounterVersion: true,
+            },
+          };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { syncPendingAnalytics } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  assert.equal(await syncPendingAnalytics(), 1000, "a pass stops at its batch budget");
+  assert.equal(posted.length, 5);
+  assert.equal(retired.size, 1000, "the rest of the backlog stays pending");
+
+  assert.equal(await syncPendingAnalytics(), 400, "a later pass drains the remainder");
+  assert.equal(posted.length, 7);
+  assert.equal(retired.size, 1400);
+});
+
 test("analytics queue and cloud operations carry one pinned account context", async (t) => {
   const context = { accountId: "account-1", authGeneration: 17 };
   const localCalls = [];

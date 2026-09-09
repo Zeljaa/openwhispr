@@ -14,6 +14,12 @@ import type {
 import { ANALYTICS_HISTORICAL_COUNTER_VERSION } from "../helpers/analytics";
 
 const BATCH_SIZE = 200;
+// A pass uploads at most this many batches. Insights waits on a pass before
+// it can read the account summary, so an unbounded drain would hold the view's
+// spinner — and hammer the batch endpoint — for the length of a whole history
+// backfill. What is left over stays pending and still counts as moved work,
+// which keeps the ambient pass cadence tight until the queue is empty.
+const MAX_BATCHES_PER_PASS = 5;
 export const ANALYTICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 export const ANALYTICS_REMOTE_REFRESH_DEBOUNCE_MS = 250;
 const requestedHistoryBackfillAccounts = new Set<string>();
@@ -211,7 +217,7 @@ async function runAnalyticsPass({
   // batch and one stuck row costs an extra POST per batch behind it.
   const offered = new Set<string>();
 
-  while (true) {
+  for (let batch = 0; batch < MAX_BATCHES_PER_PASS; batch += 1) {
     // Re-check between batches. Revoking consent while a >200-row drain is in
     // flight cannot cancel the active request, but it must stop the next one.
     if (!(await canUpload())) return synced;
@@ -250,6 +256,7 @@ async function runAnalyticsPass({
     // The whole queue fit in one read, so there is nothing behind this batch.
     if (events.length < BATCH_SIZE) return synced;
   }
+  return synced;
 }
 
 const REQUIRED_NONNEGATIVE_SUMMARY_FIELDS = [
