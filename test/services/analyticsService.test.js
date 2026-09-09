@@ -885,3 +885,49 @@ test("a withheld row is offered once per pass, not once per batch behind it", as
   assert.deepEqual(posted, [["event-0", "event-1", "event-2"]]);
   assert.equal(retired.has("event-0"), false, "the withheld row stays pending for a later pass");
 });
+
+test("rejected version-zero history survives an API rollback and syncs after recovery", async (t) => {
+  const pending = [
+    { ...EVENT, event_id: "history-rejected-by-old-api", counter_version: 0 },
+    { ...EVENT, event_id: "history-stored", counter_version: 0 },
+    { ...EVENT, event_id: "invalid-live-event", counter_version: 1 },
+  ];
+  const retired = new Set();
+  let requests = 0;
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        getPendingAnalyticsClear: async () => null,
+        getPendingAnalyticsDeletes: async () => [],
+        getPendingAnalyticsEvents: async () =>
+          pending.filter((event) => !retired.has(event.event_id)),
+        markAnalyticsEventsSynced: async (eventIds) => {
+          eventIds.forEach((eventId) => retired.add(eventId));
+          return { success: true, updated: eventIds.length };
+        },
+        cloudApiRequest: async (request) => {
+          requests += 1;
+          const accepted = request.body.events.map((event) => event.event_id);
+          return {
+            success: true,
+            data:
+              requests === 1
+                ? {
+                    accepted,
+                    rejected: ["history-rejected-by-old-api", "invalid-live-event"],
+                  }
+                : { accepted, rejected: [] },
+          };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { syncPendingAnalytics } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  assert.equal(await syncPendingAnalytics(), 2);
+  assert.deepEqual([...retired].sort(), ["history-stored", "invalid-live-event"]);
+
+  assert.equal(await syncPendingAnalytics(), 1);
+  assert.equal(retired.has("history-rejected-by-old-api"), true);
+});

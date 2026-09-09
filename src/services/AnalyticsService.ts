@@ -11,6 +11,7 @@ import type {
   AnalyticsSyncContext,
   PendingAnalyticsEvent,
 } from "../types/electron";
+import { ANALYTICS_HISTORICAL_COUNTER_VERSION } from "../helpers/analytics";
 
 const BATCH_SIZE = 200;
 export const ANALYTICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
@@ -222,22 +223,29 @@ async function runAnalyticsPass({
     if (fresh.length === 0) return synced;
     for (const event of fresh) offered.add(event.event_id);
 
-    // `accepted` is an ack list, not a list of stored rows. The endpoint
-    // validates per event and deliberately echoes back the ids it refused as
-    // permanently invalid, so marking exactly `accepted` as synced is what
-    // retires them. Narrowing this to the ids that were actually stored -- or
-    // deriving it from the sibling `rejected` field -- would leave a row that
-    // can never validate at the head of the queue forever. A batch the server
-    // refuses outright throws and stays pending for the next pass.
+    // `accepted` is an ack list, not a list of stored rows. Permanently invalid
+    // events normally appear in both response lists and must still be retired.
+    // Version-zero history is the exception: an older or rolled-back API
+    // rejects that version, so keep those specific ids pending until a
+    // compatible API stores them.
     if (!(await canUpload())) return synced;
-    const result = await postToCloud<{ accepted: string[] }>(
+    const result = await postToCloud<{ accepted?: string[]; rejected?: string[] }>(
       "/api/analytics/events/batch",
       { events: fresh },
       context
     );
     const accepted = Array.isArray(result?.accepted) ? result.accepted : [];
+    const rejected = new Set(Array.isArray(result?.rejected) ? result.rejected : []);
+    const historicalEventIds = new Set(
+      fresh
+        .filter((event) => event.counter_version === ANALYTICS_HISTORICAL_COUNTER_VERSION)
+        .map((event) => event.event_id)
+    );
+    const acknowledged = accepted.filter(
+      (eventId) => !rejected.has(eventId) || !historicalEventIds.has(eventId)
+    );
 
-    const { updated } = await window.electronAPI.markAnalyticsEventsSynced(accepted, context);
+    const { updated } = await window.electronAPI.markAnalyticsEventsSynced(acknowledged, context);
     synced += updated;
     // The whole queue fit in one read, so there is nothing behind this batch.
     if (events.length < BATCH_SIZE) return synced;
