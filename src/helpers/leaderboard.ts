@@ -10,7 +10,6 @@ import type {
 // the server actually used, and those win over these.
 export const LEADERBOARD_PAGE_SIZE = 20;
 export const LEADERBOARD_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
-export const LEADERBOARD_SHARE_MEMBER_LIMIT = 3;
 
 // Which metrics a week can rank is one fact: the weekly ones are what the
 // picker offers under "This week", and the lifetime ones are what forces a
@@ -26,7 +25,7 @@ export type LeaderboardSurface =
   | "invite"
   | "participation_loading"
   | "participation_error"
-  | "sync"
+  | "join"
   | "board";
 
 export function resolveLeaderboardSurface({
@@ -42,15 +41,14 @@ export function resolveLeaderboardSurface({
   participationReady: boolean;
   participationError: "read" | "write" | null;
 }): LeaderboardSurface {
+  if (access.state === "accept_invite" || access.state === "request_join") return access.state;
   if (!selectedScope) {
-    if (access.state === "accept_invite" || access.state === "request_join") return access.state;
     return "create";
   }
-  if (!participationReady) {
-    return participationError === "read" ? "participation_error" : "participation_loading";
-  }
+  if (participationError === "read") return "participation_error";
+  if (!participationReady) return "participation_loading";
   if (selectedScope.state === "invite") return "invite";
-  return participating ? "board" : "sync";
+  return participating ? "board" : "join";
 }
 
 export function leaderboardRequestKey(
@@ -89,7 +87,12 @@ export function resolveLeaderboardScopeKey(
   if (currentScopeKey && scopes.some((scope) => scope.key === currentScopeKey)) {
     return currentScopeKey;
   }
-  return scopes.find((scope) => scope.kind === "workspace")?.key ?? null;
+  return (
+    scopes.find((scope) => scope.kind === "workspace" && scope.state === "ready")?.key ??
+    scopes.find((scope) => scope.state === "ready")?.key ??
+    scopes.find((scope) => scope.kind === "workspace")?.key ??
+    null
+  );
 }
 
 export function missingLeaderboardMembers(memberCount: number, participantCount: number): number {
@@ -105,14 +108,6 @@ export function shouldShowLeaderboardEmptyStrip(
 
 export function shouldShowLeaderboardJumpToMe(memberCount: number): boolean {
   return memberCount >= 10;
-}
-
-export function leaderboardDisplayName(member: Pick<LeaderboardMember, "name" | "email">): string {
-  const name = member.name?.trim();
-  if (name) return name;
-  const localPart = member.email.split("@")[0] ?? "";
-  const firstToken = localPart.split(/[._+-]+/).find(Boolean) ?? "";
-  return firstToken ? `${firstToken.charAt(0).toUpperCase()}${firstToken.slice(1)}` : "Member";
 }
 
 export function normalizeLeaderboardSelection(

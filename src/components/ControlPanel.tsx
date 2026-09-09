@@ -1200,7 +1200,6 @@ export default function ControlPanel({ initialSettingsSection }: ControlPanelPro
                     setSettingsSection("account");
                     setShowSettings(true);
                   }}
-                  onInvite={() => setShowReferrals(true)}
                 />
               </Suspense>
             )}

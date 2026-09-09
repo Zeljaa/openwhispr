@@ -97,6 +97,14 @@ test("leaderboard surfaces fail closed on unknown participation before scope sta
   assert.equal(surface({ access: { ...access, state: "accept_invite" } }), "accept_invite");
   assert.equal(surface({ access: { ...access, state: "request_join" } }), "request_join");
   assert.equal(
+    surface({ access: { ...access, state: "accept_invite" }, selectedScope: scope }),
+    "accept_invite"
+  );
+  assert.equal(
+    surface({ access: { ...access, state: "request_join" }, selectedScope: scope }),
+    "request_join"
+  );
+  assert.equal(
     surface({ selectedScope: scope, participationReady: false }),
     "participation_loading"
   );
@@ -116,10 +124,19 @@ test("leaderboard surfaces fail closed on unknown participation before scope sta
     }),
     "participation_error"
   );
-  assert.equal(surface({ selectedScope: { ...scope, state: "ready" } }), "sync");
+  assert.equal(surface({ selectedScope: { ...scope, state: "ready" } }), "join");
   assert.equal(
     surface({ selectedScope: { ...scope, state: "ready" }, participating: true }),
     "board"
+  );
+  assert.equal(
+    surface({
+      selectedScope: { ...scope, state: "ready" },
+      participationReady: true,
+      participationError: "read",
+    }),
+    "participation_error",
+    "the store reports read failures after returning to its ready state"
   );
 });
 
@@ -146,23 +163,29 @@ test("workspace defaults are readable and derived only from the company domain",
   assert.equal(domainToWorkspaceName(null), "");
 });
 
-test("scope selection defaults to a membership and leaves domain-only users in the funnel", async () => {
+test("scope selection prefers a usable membership and then any usable board", async () => {
   const { resolveLeaderboardScopeKey } = await load();
   const domain = {
     key: "domain:acme.com",
     kind: "domain",
     id: "acme.com",
     name: "acme.com",
+    state: "ready",
   };
   const workspace = {
     key: "workspace:one",
     kind: "workspace",
     id: "one",
     name: "One",
+    state: "ready",
   };
+  const unavailableDomain = { ...domain, key: "domain:solo.test", state: "invite" };
+  const soloWorkspace = { ...workspace, key: "workspace:solo", state: "invite" };
 
-  assert.equal(resolveLeaderboardScopeKey([domain], null), null);
+  assert.equal(resolveLeaderboardScopeKey([domain], null), domain.key);
+  assert.equal(resolveLeaderboardScopeKey([unavailableDomain], null), null);
   assert.equal(resolveLeaderboardScopeKey([domain, workspace], null), workspace.key);
+  assert.equal(resolveLeaderboardScopeKey([soloWorkspace, domain], null), domain.key);
   assert.equal(resolveLeaderboardScopeKey([workspace, domain], domain.key), domain.key);
   assert.equal(resolveLeaderboardScopeKey([domain, workspace], null, workspace.key), workspace.key);
   assert.equal(resolveLeaderboardScopeKey([workspace], "workspace:gone"), workspace.key);
@@ -176,15 +199,4 @@ test("the partial-participation strip appears only while a board has at most one
   assert.equal(shouldShowLeaderboardEmptyStrip(5, 0), true);
   assert.equal(shouldShowLeaderboardEmptyStrip(5, 2), false);
   assert.equal(shouldShowLeaderboardEmptyStrip(1, 1), false);
-});
-
-test("share-card names never expose an email address", async () => {
-  const { leaderboardDisplayName } = await load();
-  assert.equal(
-    leaderboardDisplayName({ name: "  Sam Lee  ", email: "private@acme.com" }),
-    "Sam Lee"
-  );
-  assert.equal(leaderboardDisplayName({ name: null, email: "jane.doe+work@acme.com" }), "Jane");
-  assert.equal(leaderboardDisplayName({ name: "", email: "alex-smith@acme.com" }), "Alex");
-  assert.equal(leaderboardDisplayName({ name: null, email: "@acme.com" }), "Member");
 });

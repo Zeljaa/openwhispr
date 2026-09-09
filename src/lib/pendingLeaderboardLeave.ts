@@ -1,38 +1,31 @@
-// Leaves the user already asked for that have not reached the account yet, one
-// entry per account. Tagged with the account that asked, so the retry can only
-// ever take that account off a leaderboard — never put a different one on — and
-// held as a set, so a second account signing in and leaving cannot discard the
-// opt-out the first one is still waiting to deliver.
-const KEY = "leaderboardLeavePendingUserIds";
+// Each account owns its own key so two renderer windows changing different
+// accounts cannot lose either pending leave through shared read-modify-write state.
+const PENDING_PREFIX = "leaderboardLeavePending:";
 
-function readPendingUserIds(): string[] {
+function accountKey(userId: string): string {
+  return `${PENDING_PREFIX}${encodeURIComponent(userId)}`;
+}
+
+export function readPendingLeaderboardLeave(userId: string): boolean {
   try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter((id) => typeof id === "string") : [];
+    return localStorage.getItem(accountKey(userId)) === "true";
   } catch {
-    return [];
+    return false;
   }
 }
 
-function writePendingUserIds(userIds: string[]): void {
+export function writePendingLeaderboardLeave(userId: string): void {
   try {
-    if (userIds.length === 0) localStorage.removeItem(KEY);
-    else localStorage.setItem(KEY, JSON.stringify(userIds));
+    localStorage.setItem(accountKey(userId), "true");
   } catch {
     // Losing the record only costs the retry; the account preference is unchanged.
   }
 }
 
-export function readPendingLeaderboardLeave(userId: string): boolean {
-  return readPendingUserIds().includes(userId);
-}
-
-export function writePendingLeaderboardLeave(userId: string): void {
-  const pending = readPendingUserIds();
-  if (!pending.includes(userId)) writePendingUserIds([...pending, userId]);
-}
-
 export function clearPendingLeaderboardLeave(userId: string): void {
-  const pending = readPendingUserIds();
-  if (pending.includes(userId)) writePendingUserIds(pending.filter((id) => id !== userId));
+  try {
+    localStorage.removeItem(accountKey(userId));
+  } catch {
+    // A failed clear only causes an idempotent leave retry.
+  }
 }

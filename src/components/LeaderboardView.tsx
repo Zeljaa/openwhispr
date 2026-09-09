@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../hooks/useAuth";
+import { useLeaderboardParticipation } from "../hooks/useLeaderboardParticipation";
+import type { EnableInsightsSyncOptions } from "../hooks/useInsightsSyncOptIn";
 import { useSettings } from "../hooks/useSettings";
 import { signInWithSSO } from "../lib/auth";
 import { getValidatedAuthGeneration } from "../lib/authRequestContext";
@@ -9,26 +11,16 @@ import { usePolicyStore } from "../stores/policyStore";
 import LeaderboardSection from "./LeaderboardSection";
 
 interface LeaderboardViewProps {
-  disableInsightsSync: () => Promise<boolean>;
+  enableInsightsSync: (options?: EnableInsightsSyncOptions) => Promise<boolean>;
+  insightsSyncEnabled: boolean;
   onSignIn: () => void;
-  onInvite: () => void;
-  participationEnabled: boolean;
-  participationError: "read" | "write" | null;
-  participationReady: boolean;
-  participationUpdating: boolean;
-  refreshParticipation: () => Promise<void>;
   syncAllowedByPolicy: boolean;
 }
 
 export default function LeaderboardView({
-  disableInsightsSync,
+  enableInsightsSync,
+  insightsSyncEnabled,
   onSignIn,
-  onInvite,
-  participationEnabled,
-  participationError,
-  participationReady,
-  participationUpdating,
-  refreshParticipation,
   syncAllowedByPolicy,
 }: LeaderboardViewProps) {
   const { t } = useTranslation();
@@ -38,6 +30,15 @@ export default function LeaderboardView({
   const [ssoStarting, setSsoStarting] = useState(false);
   const [ssoError, setSsoError] = useState<string | null>(null);
   const { dataRetentionEnabled: personalDataRetentionEnabled } = useSettings();
+  const {
+    enabled: participationEnabled,
+    error: participationError,
+    join: joinParticipation,
+    leave: leaveParticipation,
+    ready: participationReady,
+    refresh: refreshParticipation,
+    updating: participationUpdating,
+  } = useLeaderboardParticipation();
   const dataRetentionEnabled = usePolicyStore((policyState) =>
     effectiveLocalHistoryEnabled(policyState, personalDataRetentionEnabled)
   );
@@ -89,6 +90,12 @@ export default function LeaderboardView({
     setSsoStarting(false);
   }, [oauthProtocolRegistered, onSignIn, ssoStarting, t, user?.email]);
 
+  const joinLeaderboard = useCallback(async () => {
+    if (!insightsSyncEnabled && !(await enableInsightsSync({ confirmWhenEmpty: true })))
+      return false;
+    return joinParticipation();
+  }, [enableInsightsSync, insightsSyncEnabled, joinParticipation]);
+
   return (
     <>
       <LeaderboardSection
@@ -98,13 +105,12 @@ export default function LeaderboardView({
         isSignedIn={isSignedIn}
         participating={isSignedIn && participationEnabled}
         cloudAccessAllowed={syncAllowedByPolicy}
-        canJoin={
-          isSignedIn && syncAllowedByPolicy && dataRetentionEnabled && !participationUpdating
-        }
+        canJoin={isSignedIn && syncAllowedByPolicy && dataRetentionEnabled}
         participationReady={participationReady}
         participationError={participationError}
         participationUpdating={participationUpdating}
-        onLeave={disableInsightsSync}
+        onJoin={joinLeaderboard}
+        onLeave={leaveParticipation}
         onRefreshParticipation={refreshParticipation}
         onSignIn={onSignIn}
         onSsoSignIn={() => void startSsoSignIn()}
@@ -113,7 +119,6 @@ export default function LeaderboardView({
           oauthProtocolRegistered === false ? t("auth.social.protocolUnavailable") : ssoError
         }
         ssoStarting={ssoStarting}
-        onInvite={onInvite}
       />
     </>
   );

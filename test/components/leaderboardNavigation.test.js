@@ -22,37 +22,53 @@ test("the leaderboard is tabbed inside the Insights view", () => {
   assert.ok(insights.includes('value="usage"'));
   assert.ok(insights.includes('t("insights.yourUsage")'));
   assert.ok(insights.includes('value="leaderboard"'));
-  for (const className of [
-    'className="h-7 p-0.5 rounded-[7px]"',
-    'className="h-6 px-2.5 text-xs rounded-[5px]"',
-  ]) {
-    assert.ok(dictionary.includes(className));
-    assert.ok(insights.includes(className));
-  }
+  assert.ok(dictionary.includes('className="h-7 p-0.5 rounded-[7px]"'));
+  assert.ok(insights.includes('className="h-7 p-0.5 rounded-[7px]"'));
+  assert.ok(dictionary.includes('className="h-6 px-2.5 text-xs rounded-[5px]"'));
+  assert.ok(insights.includes('className="h-6 px-2.5 text-xs rounded-[5px]"'));
   assert.ok(insights.includes("<LeaderboardView"));
   assert.ok(insights.includes("syncService.syncAnalyticsNow()"));
+  assert.ok(insights.includes("const authValidated = hasValidatedAuthContext()"));
+  assert.ok(insights.includes("isSignedIn &&\n    authValidated &&\n    insightsSyncEnabled"));
   assert.equal(insights.includes("syncPendingAnalytics"), false);
-  assert.ok(insights.includes("onClick={() => void joinLeaderboard()}"));
-  assert.ok(insights.includes('"insights.syncAndJoinConfirm"'));
+  assert.ok(insights.includes("onClick={() => void enableInsightsSync()}"));
+  assert.ok(insights.includes('"insights.enableSync"'));
   assert.ok(insights.includes("onSyncErrorChange={setSyncError}"));
+  assert.ok(insights.includes('activeTab === "usage"'));
+  assert.ok(insights.includes('variant="default"'));
+  assert.ok(insights.includes("participationReady &&"));
+  assert.ok(insights.includes("participationError === null"));
+  assert.ok(insights.includes("!participationEnabled"));
+  assert.ok(insights.includes('t("insights.leaderboard.disabled")'));
+  const usageContent = insights.slice(
+    insights.indexOf('<TabsContent value="usage"'),
+    insights.indexOf('<TabsContent value="leaderboard"')
+  );
+  assert.ok(usageContent.includes("isLoaded && !syncActive"));
+  assert.ok(usageContent.includes('t("insights.onDevicePrivacy")'));
+  assert.ok(usageContent.includes("mt-auto pt-8"));
+  assert.equal(
+    insights
+      .slice(insights.indexOf('<TabsContent value="leaderboard"'))
+      .includes("onDevicePrivacy"),
+    false
+  );
   assert.ok(leaderboard.includes("<LeaderboardSection"));
   assert.equal(
-    leaderboard.includes("useInsightsSyncOptIn"),
+    leaderboard.includes("useInsightsSyncOptIn()"),
     false,
     "the nested tab must reuse the page's opt-in owner instead of duplicating analytics IPCs"
   );
-  assert.equal(leaderboard.includes("onJoin="), false);
+  assert.ok(leaderboard.includes("onJoin={joinLeaderboard}"));
   assert.equal(leaderboard.includes('<h1 className="text-base!'), false);
   assert.equal(leaderboard.includes('t("insights.leaderboard.description")'), false);
 });
 
-test("combined sync consent copy is concise and discloses profile sharing", () => {
+test("analytics and leaderboard consent copy are concise and independently scoped", () => {
   for (const locale of ["en", "de", "es", "fr", "it", "ja", "pt", "ru", "zh-CN", "zh-TW"]) {
     const { insights } = JSON.parse(read(`src/locales/${locale}/translation.json`));
     const descriptions = [
-      insights.syncAndJoinDisclosure,
-      insights.syncAndJoinEmptyDescription,
-      insights.leaderboard.syncDescription,
+      insights.leaderboard.joinDescription,
       ...Object.entries(insights)
         .filter(([key]) => /^(claim|enable)Description_/.test(key))
         .map(([, value]) => value),
@@ -64,8 +80,8 @@ test("combined sync consent copy is concise and discloses profile sharing", () =
   }
 
   const english = JSON.parse(read("src/locales/en/translation.json")).insights;
-  assert.match(english.leaderboard.syncDescription, /name, email, and activity/);
-  assert.doesNotMatch(english.leaderboard.syncDescription, /Only activity counters/);
+  assert.match(english.leaderboard.joinDescription, /name, email, and activity/);
+  assert.doesNotMatch(english.enableDescription_other, /name|email|leaderboard/);
 });
 
 test("leaderboard access is plan agnostic and invitation led", () => {
@@ -75,8 +91,14 @@ test("leaderboard access is plan agnostic and invitation led", () => {
 
   assert.equal(section.includes("LeaderboardFreePreview"), false);
   assert.equal(view.includes("onUpgrade"), false);
-  assert.ok(section.includes("inviteToLeaderboard"));
-  assert.ok(section.includes('t("insights.leaderboard.inviteCta")'));
+  assert.ok(section.includes("openLeaderboardGrowthAction"));
+  assert.ok(section.includes('"insights.leaderboard.inviteCta"'));
+  assert.ok(section.includes('selectedScope.kind === "domain"'));
+  assert.ok(section.includes('scope.kind === "workspace"'));
+  assert.ok(section.includes('"settingsPage.workspace.empty.create"'));
+  assert.ok(section.includes("setCreateWorkspaceOpen(true)"));
+  assert.ok(section.includes("boardParticipantCount"));
+  assert.ok(section.includes("visibleLeaderboard?.totalMembers"));
   assert.ok(section.includes("<LeaderboardSetupCard"));
   assert.ok(section.includes("<LeaderboardSoloEmptyState"));
   assert.ok(section.includes("<LeaderboardAcceptInvitePreview"));
@@ -87,10 +109,30 @@ test("leaderboard access is plan agnostic and invitation led", () => {
   assert.ok(section.includes("resolveLeaderboardScopeKey"));
   assert.ok(section.includes('t("insights.leaderboard.chooseBoard")'));
   assert.ok(section.includes('selectedScope?.state === "invite"'));
-  assert.ok(section.includes("<LeaderboardSyncPreview"));
+  assert.ok(section.includes("<LeaderboardJoinPreview"));
   assert.equal(section.includes("<LeaderboardSyncRow"), false);
   assert.equal(section.includes("activationDescription"), false);
-  assert.ok(controlPanel.includes("onInvite={() => setShowReferrals(true)}"));
+  assert.equal(controlPanel.includes("onInvite={() => setShowReferrals(true)}"), false);
+});
+
+test("leaderboard access waits for validated auth and labels ranked participants", () => {
+  const section = read("src/components/LeaderboardSection.tsx");
+  const accessLoader = section.slice(
+    section.indexOf("const loadAccess"),
+    section.indexOf("useEffect(() =>", section.indexOf("const loadAccess"))
+  );
+  const boardHeader = section.slice(
+    section.indexOf('data-leaderboard-state="board"'),
+    section.indexOf("<DropdownMenu", section.indexOf('data-leaderboard-state="board"'))
+  );
+
+  assert.ok(
+    accessLoader.indexOf("authGeneration == null") <
+      accessLoader.indexOf("LeaderboardService.getAccess()")
+  );
+  assert.ok(accessLoader.includes("[accountId, authGeneration]"));
+  assert.ok(boardHeader.includes("boardParticipantCount"));
+  assert.equal(boardHeader.includes("selectedScope.memberCount"), false);
 });
 
 test("an SSO-required board starts company reauthentication directly", () => {

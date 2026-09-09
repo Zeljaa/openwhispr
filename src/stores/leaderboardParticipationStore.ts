@@ -1,15 +1,14 @@
 import { create } from "zustand";
+import { writePendingLeaderboardLeave } from "../lib/pendingLeaderboardLeave";
 import {
-  clearPendingLeaderboardLeave,
-  writePendingLeaderboardLeave,
-} from "../lib/pendingLeaderboardLeave";
-import { LeaderboardService } from "../services/LeaderboardService";
+  LeaderboardService,
+  type LeaderboardParticipationAuthContext,
+} from "../services/LeaderboardService";
 
 /**
- * The account's leaderboard participation, shared by every surface that reads
- * or changes it. Settings and the Insights page can both mount
- * useInsightsSyncOptIn, and while each kept its own copy an opt-out taken in one
- * left the other showing a roster the user had already left.
+ * The account's leaderboard participation, shared by every leaderboard surface
+ * that reads or changes it. It is independent of this device's Insights Sync
+ * setting.
  *
  * Nothing here joins on the user's behalf: only join() ever sends `true`, and
  * a leave the network refused is held on the device and retried until the
@@ -26,44 +25,21 @@ interface LeaderboardParticipationState {
   error: "read" | "write" | null;
   updating: boolean;
   reset: () => void;
-  refresh: (userId: string | null) => Promise<void>;
+  refresh: (context: LeaderboardParticipationAuthContext) => Promise<void>;
   publishAnswer: (enabled: boolean, configured: boolean, generation: number) => void;
-  join: (userId: string | null) => Promise<boolean>;
-  leave: (userId: string | null) => Promise<boolean>;
+  join: (context: LeaderboardParticipationAuthContext) => Promise<boolean>;
+  leave: (context: LeaderboardParticipationAuthContext) => Promise<boolean>;
+  queueLeave: (userId: string) => void;
 }
 
 // A completed write is the newest answer there is, so it retires every read
-// still in flight — including one the sync toggle started after the request
-// went out, which would otherwise settle the account on pre-write state.
+// still in flight, which would otherwise settle the account on pre-write state.
 // Writes read the same counter: one taken out for the departing account has no
 // answer to give about the account that replaced it.
 let readId = 0;
 // Keep write invalidation separate so an older account cannot clear a newer account's pending state.
 let writeId = 0;
-// One account can expose the action through more than one renderer surface.
-// Serialize its writes so the server applies them in user-intent order and a
-// stale failure cannot re-arm a leave after a newer join has cleared it.
-const accountWriteTails = new Map<string, Promise<void>>();
-
-async function serializeAccountWrite<T>(
-  userId: string | null,
-  write: () => Promise<T>
-): Promise<T> {
-  if (!userId) return write();
-  const previous = accountWriteTails.get(userId) ?? Promise.resolve();
-  let release!: () => void;
-  const tail = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  accountWriteTails.set(userId, tail);
-  await previous;
-  try {
-    return await write();
-  } finally {
-    release();
-    if (accountWriteTails.get(userId) === tail) accountWriteTails.delete(userId);
-  }
-}
+let activeRefresh: { key: string; promise: Promise<void> } | null = null;
 
 export const useLeaderboardParticipationStore = create<LeaderboardParticipationState>(
   (set, get) => ({
@@ -76,9 +52,9 @@ export const useLeaderboardParticipationStore = create<LeaderboardParticipationS
     reset: () => {
       readId += 1;
       writeId += 1;
-      // updating with it: a write left running for the departing account would
-      // otherwise keep refresh() deferring the new account's read for as long
-      // as its request takes to settle.
+      activeRefresh = null;
+      // Reset updating too: a write left running for the departing account must
+      // not make refresh() skip the replacement account's read.
       set({ enabled: false, configured: false, ready: false, error: null, updating: false });
     },
 
@@ -92,58 +68,56 @@ export const useLeaderboardParticipationStore = create<LeaderboardParticipationS
     // Read-only, and only when a caller asks: the account preference is the one
     // source of truth for who is on a leaderboard, and nothing here may join or
     // leave one on the user's behalf.
-    refresh: async (userId) => {
-      // A write already in flight is the newer answer by definition — reading
-      // around it would settle the account on the state it is mid-change.
+    refresh: async (context) => {
+      const key = `${context.userId}:${context.authGeneration}`;
+      if (activeRefresh?.key === key) {
+        await activeRefresh.promise;
+        return;
+      }
+      // A write already in flight is the newer answer by definition — skip a
+      // read that could settle the account on the state it is mid-change.
       if (get().updating) return;
-      const currentReadId = ++readId;
-      set({ ready: false, error: null });
+
+      const promise = (async () => {
+        const currentReadId = ++readId;
+        set({ ready: false, error: null });
+        try {
+          // An opt-out the network never delivered is retried first, so the answer
+          // below is the one the user asked for rather than the row it left behind.
+          const stillLeaving = await LeaderboardService.flushPendingLeave(context);
+          const participation = await LeaderboardService.getParticipation(context);
+          if (currentReadId !== readId) return;
+          set({
+            enabled: participation.enabled && !stillLeaving,
+            configured: participation.configured || stillLeaving,
+          });
+        } catch (error) {
+          if (currentReadId !== readId) return;
+          console.error("Reading leaderboard participation failed:", error);
+          // A read that failed leaves participation unknown, so it has to fail
+          // closed. Keeping the last answer would also let the leaderboard's 403
+          // recovery re-read, fail, and immediately re-issue the same 403 forever.
+          // The surface offers a Retry rather than a Join, which would ask an
+          // account that may already be on a leaderboard to join it again.
+          set({ enabled: false, configured: false, error: "read" });
+        } finally {
+          if (currentReadId === readId) set({ ready: true });
+        }
+      })();
+      activeRefresh = { key, promise };
       try {
-        // An opt-out the network never delivered is retried first, so the answer
-        // below is the one the user asked for rather than the row it left behind.
-        const stillLeaving = await LeaderboardService.flushPendingLeave(userId);
-        const participation = await LeaderboardService.getParticipation();
-        if (currentReadId !== readId) return;
-        set({
-          enabled: participation.enabled && !stillLeaving,
-          configured: participation.configured || stillLeaving,
-        });
-      } catch (error) {
-        if (currentReadId !== readId) return;
-        console.error("Reading leaderboard participation failed:", error);
-        // A read that failed leaves participation unknown, so it has to fail
-        // closed. Keeping the last answer would also let the leaderboard's 403
-        // recovery re-read, fail, and immediately re-issue the same 403 forever.
-        // The surface offers a Retry rather than a Join, which would ask an
-        // account that may already be on a leaderboard to join it again.
-        set({ enabled: false, configured: false, error: "read" });
+        await promise;
       } finally {
-        if (currentReadId === readId) set({ ready: true });
+        if (activeRefresh?.promise === promise) activeRefresh = null;
       }
     },
 
-    join: async (userId) => {
+    join: async (context) => {
       const generation = readId;
       const currentWriteId = ++writeId;
       set({ updating: true });
-      // The account says yes here, which retires any leave still queued for it —
-      // before the request goes out, not after it lands, because turning the sync
-      // toggle on re-reads participation and that read would flush the queued
-      // leave into a PATCH racing this join. A declined opt-in never reaches
-      // here, so its leave is never touched.
       try {
-        const participation = await serializeAccountWrite(userId, async () => {
-          if (userId) clearPendingLeaderboardLeave(userId);
-          try {
-            return await LeaderboardService.setParticipation(true);
-          } catch (error) {
-            // A timeout or auth-fence failure can arrive after the API committed
-            // the join. Sync remains off when the caller sees a failure, so queue
-            // a compensating leave before a newer write is allowed to start.
-            if (userId) writePendingLeaderboardLeave(userId);
-            throw error;
-          }
-        });
+        const participation = await LeaderboardService.joinParticipation(context);
         if (currentWriteId === writeId) {
           get().publishAnswer(participation.enabled, participation.configured, generation);
         }
@@ -160,23 +134,12 @@ export const useLeaderboardParticipationStore = create<LeaderboardParticipationS
       }
     },
 
-    leave: async (userId) => {
+    leave: async (context) => {
       const generation = readId;
       const currentWriteId = ++writeId;
       set({ updating: true });
       try {
-        const participation = await serializeAccountWrite(userId, async () => {
-          try {
-            const answer = await LeaderboardService.setParticipation(false);
-            if (userId) clearPendingLeaderboardLeave(userId);
-            return answer;
-          } catch (error) {
-            // The record is tagged with the account that asked, and is written
-            // before a newer operation may start for the same account.
-            if (userId) writePendingLeaderboardLeave(userId);
-            throw error;
-          }
-        });
+        const participation = await LeaderboardService.leaveParticipation(context);
         if (currentWriteId === writeId) {
           get().publishAnswer(participation.enabled, participation.configured, generation);
         }
@@ -191,6 +154,15 @@ export const useLeaderboardParticipationStore = create<LeaderboardParticipationS
       } finally {
         if (currentWriteId === writeId) set({ updating: false });
       }
+    },
+
+    // A click taken while auth is revalidating is still an opt-out. Stop
+    // presenting participation now and deliver the account-scoped leave as
+    // soon as that same account regains a validated credential.
+    queueLeave: (userId) => {
+      writePendingLeaderboardLeave(userId);
+      const generation = readId;
+      get().publishAnswer(false, true, generation);
     },
   })
 );
