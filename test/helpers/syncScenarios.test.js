@@ -147,6 +147,31 @@ function linkLocalNote(db, cloudRow, title, content) {
   });
 }
 
+test("transcription sync identifies an independently-uploaded analytics event", async (t) => {
+  const cloud = freshCloud();
+  const device = createDevice(t, cloud);
+  if (!device) return;
+  device.storage.insightsSyncEnabled = "true";
+  device.db.setActiveAccountId("user-harness");
+  device.db.recordAnalyticsEvent({
+    eventId: "analytics-signal",
+    wordCount: 3,
+    occurredAt: "2026-07-20T11:00:00.000Z",
+    localDate: "2026-07-20",
+    mode: "local",
+  });
+  device.db.saveTranscription("one two three", null, {
+    clientTranscriptionId: "analytics-signal",
+    analyticsOccurredAt: "2026-07-20T11:00:00.000Z",
+  });
+
+  await syncOnce(device);
+
+  const requests = cloud.logFor("/api/transcriptions/batch-create");
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].body.transcriptions[0].analytics_event_expected, true);
+});
+
 test("S1 a meeting shell that gains a large transcript survives a relaunch and reaches the cloud", async (t) => {
   const cloud = freshCloud();
   const device = createDevice(t, cloud);
@@ -326,9 +351,8 @@ test("S2 two devices: an older empty shell never destroys the transcript and the
   const mark2 = cloud.log.length;
   await syncOnce(deviceA);
   assert.equal(
-    cloud.log
-      .slice(mark2)
-      .filter((c) => c.method === "PATCH" && c.path === "/api/notes/update").length,
+    cloud.log.slice(mark2).filter((c) => c.method === "PATCH" && c.path === "/api/notes/update")
+      .length,
     0,
     "a conflicted row must not be re-pushed before the user resolves it"
   );

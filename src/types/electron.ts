@@ -159,6 +159,7 @@ export interface TranscriptionItem {
   cloud_id: string | null;
   sync_status: "synced" | "pending" | "error";
   deleted_at: string | null;
+  exact_analytics_event_present?: number;
 }
 
 export type AnalyticsMode = "local" | "openwhispr_cloud" | "byok" | "self_hosted" | "unknown";
@@ -211,6 +212,7 @@ export interface AnalyticsSummary {
   longestStreakDays: number;
   wpmCoveragePercent: number;
   daily: AnalyticsDailyBucket[];
+  historyBackfillRetryRequired?: boolean;
 }
 
 export type LeaderboardMetric =

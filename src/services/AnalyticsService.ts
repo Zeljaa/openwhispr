@@ -223,17 +223,16 @@ async function runAnalyticsPass({
     if (fresh.length === 0) return synced;
     for (const event of fresh) offered.add(event.event_id);
 
-    // `accepted` is an ack list, not a list of stored rows. Permanently invalid
-    // events normally appear in both response lists and must still be retired.
-    // Version-zero history is the exception: an older or rolled-back API
-    // rejects that version, so keep those specific ids pending until a
-    // compatible API stores them.
+    // `accepted` is an ack list, not a list of stored rows. Only a capable API
+    // can distinguish a permanently invalid version-zero row from an older
+    // deployment rejecting that version altogether. Keep those ids pending
+    // when the capability is absent so an API rollback cannot destroy history.
     if (!(await canUpload())) return synced;
-    const result = await postToCloud<{ accepted?: string[]; rejected?: string[] }>(
-      "/api/analytics/events/batch",
-      { events: fresh },
-      context
-    );
+    const result = await postToCloud<{
+      accepted?: string[];
+      rejected?: string[];
+      supportsHistoricalCounterVersion?: boolean;
+    }>("/api/analytics/events/batch", { events: fresh }, context);
     const accepted = Array.isArray(result?.accepted) ? result.accepted : [];
     const rejected = new Set(Array.isArray(result?.rejected) ? result.rejected : []);
     const historicalEventIds = new Set(
@@ -241,9 +240,10 @@ async function runAnalyticsPass({
         .filter((event) => event.counter_version === ANALYTICS_HISTORICAL_COUNTER_VERSION)
         .map((event) => event.event_id)
     );
-    const acknowledged = accepted.filter(
-      (eventId) => !rejected.has(eventId) || !historicalEventIds.has(eventId)
-    );
+    const acknowledged =
+      result?.supportsHistoricalCounterVersion === true
+        ? accepted
+        : accepted.filter((eventId) => !rejected.has(eventId) || !historicalEventIds.has(eventId));
 
     const { updated } = await window.electronAPI.markAnalyticsEventsSynced(acknowledged, context);
     synced += updated;
@@ -293,10 +293,14 @@ function isAnalyticsSummary(value: unknown): value is AnalyticsSummary {
     value.averageWpm === null || isNonnegativeFiniteNumber(value.averageWpm);
   const coverageIsValid =
     isNonnegativeFiniteNumber(value.wpmCoveragePercent) && value.wpmCoveragePercent <= 100;
+  const retryHintIsValid =
+    value.historyBackfillRetryRequired === undefined ||
+    typeof value.historyBackfillRetryRequired === "boolean";
   return (
     totalsAreValid &&
     averageWpmIsValid &&
     coverageIsValid &&
+    retryHintIsValid &&
     Array.isArray(value.daily) &&
     value.daily.length <= 366 &&
     value.daily.every(isAnalyticsDailyBucket)
@@ -332,6 +336,9 @@ export async function getAccountAnalyticsSummary(
   // must not start another continuation chain on the next refresh.
   if (!isAnalyticsSummary(summary)) {
     throw new Error("Malformed analytics summary from cloud");
+  }
+  if (requestHistoryBackfill && accountId && summary.historyBackfillRetryRequired === true) {
+    requestedHistoryBackfillAccounts.delete(accountId);
   }
   return summary;
 }

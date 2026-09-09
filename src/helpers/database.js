@@ -1699,14 +1699,15 @@ class DatabaseManager {
       // The projection is the wire shape: AnalyticsService posts these rows
       // verbatim, so every column here has to satisfy the batch endpoint's
       // event schema -- occurred_at included, which that schema requires
-      // alongside local_date. It also orders the batch, oldest dictation first.
+      // alongside local_date. Exact events go first so rejected historical
+      // rows cannot block current activity during an API rollback.
       return this.db
         .prepare(
           `SELECT event_id, occurred_at, local_date, word_count, spoken_duration_ms,
                   mode, provider, model, counter_version
            FROM analytics_events
            WHERE account_id = ? AND sync_status = 'pending' AND deleted_at IS NULL
-           ORDER BY occurred_at ASC LIMIT ?`
+           ORDER BY (counter_version = 0) ASC, occurred_at ASC LIMIT ?`
         )
         .all(accountId, safeLimit);
     } catch (error) {
@@ -2112,8 +2113,19 @@ class DatabaseManager {
   getTranscriptionById(id) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      const stmt = this.db.prepare("SELECT * FROM transcriptions WHERE id = ?");
-      return stmt.get(id) || null;
+      const stmt = this.db.prepare(
+        `SELECT transcription.*,
+                EXISTS (
+                  SELECT 1 FROM analytics_events event
+                  WHERE event.event_id = transcription.client_transcription_id
+                    AND event.account_id = ?
+                    AND event.deleted_at IS NULL
+                    AND event.counter_version >= 1
+                ) AS exact_analytics_event_present
+         FROM transcriptions transcription
+         WHERE transcription.id = ?`
+      );
+      return stmt.get(this.activeAccountId, id) || null;
     } catch (error) {
       debugLogger.error("Error getting transcription by id", { error: error.message }, "database");
       throw error;
@@ -6860,9 +6872,19 @@ class DatabaseManager {
       if (!this.db) throw new Error("Database not initialized");
       return this.db
         .prepare(
-          "SELECT * FROM transcriptions WHERE sync_status = 'pending' AND deleted_at IS NULL"
+          `SELECT transcription.*,
+                  EXISTS (
+                    SELECT 1 FROM analytics_events event
+                    WHERE event.event_id = transcription.client_transcription_id
+                      AND event.account_id = ?
+                      AND event.deleted_at IS NULL
+                      AND event.counter_version >= 1
+                  ) AS exact_analytics_event_present
+           FROM transcriptions transcription
+           WHERE transcription.sync_status = 'pending'
+             AND transcription.deleted_at IS NULL`
         )
-        .all();
+        .all(this.activeAccountId);
     } catch (error) {
       debugLogger.error(
         "Error getting pending transcriptions",

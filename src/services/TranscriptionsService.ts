@@ -10,6 +10,7 @@ interface TranscriptionInput {
   audio_duration_ms?: number | null;
   status?: string;
   created_at?: string;
+  analytics_event_expected?: boolean;
 }
 
 interface CloudTranscription {

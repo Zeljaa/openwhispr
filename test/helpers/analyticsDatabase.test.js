@@ -841,6 +841,48 @@ test("the pending batch carries both the precise timestamp and the local date", 
   }
 });
 
+test("pending analytics prioritize live events over historical rollback retries", (t) => {
+  const db = createDb(t);
+  if (!db) return;
+
+  db.setActiveAccountId("account-a");
+  recordEvent(db, "old-history", { occurredAt: "2026-01-01T09:00:00.000Z" });
+  recordEvent(db, "new-live", { occurredAt: "2026-08-30T09:00:00.000Z" });
+  db.db
+    .prepare("UPDATE analytics_events SET counter_version = 0 WHERE event_id = 'old-history'")
+    .run();
+
+  assert.deepEqual(
+    db.getPendingAnalyticsEvents(1).map((row) => row.event_id),
+    ["new-live"],
+    "an old API rejecting version-zero history must not hold live analytics behind it"
+  );
+});
+
+test("transcription sync only expects an exact analytics event for the active account", (t) => {
+  const db = createDb(t);
+  if (!db) return;
+
+  db.setActiveAccountId("account-a");
+  for (const eventId of ["exact", "history"]) {
+    recordEvent(db, eventId);
+    db.saveTranscription(eventId, null, { clientTranscriptionId: eventId });
+  }
+  db.db.prepare("UPDATE analytics_events SET counter_version = 0 WHERE event_id = 'history'").run();
+
+  db.setActiveAccountId(null);
+  recordEvent(db, "unclaimed");
+  db.saveTranscription("unclaimed", null, { clientTranscriptionId: "unclaimed" });
+  db.setActiveAccountId("account-a");
+
+  const expectationById = Object.fromEntries(
+    db
+      .getPendingTranscriptions()
+      .map((row) => [row.client_transcription_id, row.exact_analytics_event_present])
+  );
+  assert.deepEqual(expectationById, { exact: 1, history: 0, unclaimed: 0 });
+});
+
 test("the opt-in count covers everything turning sync on would upload", (t) => {
   const db = createDb(t);
   if (!db) return;

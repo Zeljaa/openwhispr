@@ -363,6 +363,41 @@ test("account analytics retries the history trigger after a failed request", asy
   );
 });
 
+test("account analytics retries the history trigger when queue scheduling is unavailable", async (t) => {
+  const requests = [];
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        cloudApiRequest: async (request) => {
+          requests.push(request);
+          return {
+            success: true,
+            data: {
+              ...VALID_SUMMARY,
+              historyBackfillRetryRequired: requests.length === 1,
+            },
+          };
+        },
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { getAccountAnalyticsSummary } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  assert.equal(
+    (await getAccountAnalyticsSummary("queue-retry-account")).historyBackfillRetryRequired,
+    true
+  );
+  await getAccountAnalyticsSummary("queue-retry-account");
+
+  assert.deepEqual(
+    requests.map((request) =>
+      new URL(request.path, "https://api.openwhispr.com").searchParams.get("backfill")
+    ),
+    ["true", "true"]
+  );
+});
+
 for (const [name, daily] of [
   ["a null bucket", [null]],
   ["an impossible date", [{ ...VALID_SUMMARY.daily[0], date: "2026-02-30" }]],
@@ -916,7 +951,11 @@ test("rejected version-zero history survives an API rollback and syncs after rec
                     accepted,
                     rejected: ["history-rejected-by-old-api", "invalid-live-event"],
                   }
-                : { accepted, rejected: [] },
+                : {
+                    accepted,
+                    rejected: [],
+                    supportsHistoricalCounterVersion: true,
+                  },
           };
         },
       },
@@ -930,4 +969,35 @@ test("rejected version-zero history survives an API rollback and syncs after rec
 
   assert.equal(await syncPendingAnalytics(), 1);
   assert.equal(retired.has("history-rejected-by-old-api"), true);
+});
+
+test("a capable API can permanently retire invalid version-zero history", async (t) => {
+  const event = { ...EVENT, event_id: "permanently-invalid-history", counter_version: 0 };
+  const retired = new Set();
+  installBrowserGlobals(t, {
+    window: {
+      electronAPI: {
+        getPendingAnalyticsClear: async () => null,
+        getPendingAnalyticsDeletes: async () => [],
+        getPendingAnalyticsEvents: async () => (retired.has(event.event_id) ? [] : [event]),
+        markAnalyticsEventsSynced: async (eventIds) => {
+          eventIds.forEach((eventId) => retired.add(eventId));
+          return { success: true, updated: eventIds.length };
+        },
+        cloudApiRequest: async () => ({
+          success: true,
+          data: {
+            accepted: [event.event_id],
+            rejected: [event.event_id],
+            supportsHistoricalCounterVersion: true,
+          },
+        }),
+      },
+    },
+  });
+  const vite = await createRendererServer(t);
+  const { syncPendingAnalytics } = await vite.ssrLoadModule("/services/AnalyticsService.ts");
+
+  assert.equal(await syncPendingAnalytics(), 1);
+  assert.equal(retired.has(event.event_id), true);
 });
