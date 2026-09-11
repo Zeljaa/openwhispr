@@ -980,7 +980,6 @@ export class SyncService {
       audio_duration_ms: t.audio_duration_ms,
       status: t.status,
       created_at: t.created_at,
-      analytics_event_expected: this.consent().analytics && t.exact_analytics_event_present === 1,
     });
     await window.electronAPI.markTranscriptionSynced?.(t.id, cloud.id);
   }
@@ -2309,8 +2308,6 @@ export class SyncService {
             audio_duration_ms: t.audio_duration_ms,
             status: t.status,
             created_at: t.created_at,
-            analytics_event_expected:
-              this.consent().analytics && t.exact_analytics_event_present === 1,
           }))
         );
         for (const cloudT of created) {

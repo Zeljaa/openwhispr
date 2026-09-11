@@ -859,28 +859,45 @@ test("pending analytics prioritize live events over historical rollback retries"
   );
 });
 
-test("transcription sync only expects an exact analytics event for the active account", (t) => {
+test("a dictation pulled from the cloud is dated when it was spoken, not when it synced", (t) => {
   const db = createDb(t);
   if (!db) return;
 
-  db.setActiveAccountId("account-a");
-  for (const eventId of ["exact", "history"]) {
-    recordEvent(db, eventId);
-    db.saveTranscription(eventId, null, { clientTranscriptionId: eventId });
-  }
-  db.db.prepare("UPDATE analytics_events SET counter_version = 0 WHERE event_id = 'history'").run();
+  // The history list sorts on timestamp. Leaving cloud rows to default it makes
+  // a whole pull land at "now" and sort above dictations spoken since, so an
+  // old archive arrives on top of this morning's work.
+  db.upsertTranscriptionFromCloud({
+    client_transcription_id: "from-cloud",
+    id: "cloud-1",
+    text: "spoken last spring",
+    created_at: "2026-04-01 09:00:00",
+  });
 
-  db.setActiveAccountId(null);
-  recordEvent(db, "unclaimed");
-  db.saveTranscription("unclaimed", null, { clientTranscriptionId: "unclaimed" });
-  db.setActiveAccountId("account-a");
+  const [row] = db.getTranscriptions(10);
+  assert.equal(row.client_transcription_id, "from-cloud");
+  assert.equal(row.timestamp, "2026-04-01 09:00:00");
+});
 
-  const expectationById = Object.fromEntries(
-    db
-      .getPendingTranscriptions()
-      .map((row) => [row.client_transcription_id, row.exact_analytics_event_present])
-  );
-  assert.deepEqual(expectationById, { exact: 1, history: 0, unclaimed: 0 });
+test("a cloud pull does not overwrite the local recording time it already has", (t) => {
+  const db = createDb(t);
+  if (!db) return;
+
+  // The device that made the dictation recorded when speech started; the cloud
+  // only knows when the row was created. The local value is the better one.
+  db.saveTranscription("spoken here", null, {
+    clientTranscriptionId: "local-first",
+    analyticsOccurredAt: "2026-04-01T09:00:00.000Z",
+  });
+  db.upsertTranscriptionFromCloud({
+    client_transcription_id: "local-first",
+    id: "cloud-2",
+    text: "spoken here, cleaned",
+    created_at: "2026-04-02 17:30:00",
+  });
+
+  const [row] = db.getTranscriptions(10);
+  assert.equal(row.timestamp, "2026-04-01 09:00:00.000Z");
+  assert.equal(row.text, "spoken here, cleaned", "the pull still updates the transcript");
 });
 
 test("the opt-in count covers everything turning sync on would upload", (t) => {

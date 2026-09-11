@@ -29,9 +29,42 @@ function createContext(backfillAnalyticsHistoryBatch, targetId = 10) {
       },
     },
     _analyticsHistoryBackfillPromise: null,
+    _retentionSettings: { dataRetentionEnabled: true },
+    _retentionSettingsSynced: true,
     analyticsHistoryBackfillState: state,
   });
 }
+
+test("history is not reconstructed until the renderer reports the retention setting", async () => {
+  let scans = 0;
+  const context = createContext(() => {
+    scans += 1;
+    return completeBatch({ nextCursor: 10 });
+  });
+  // The main process boots with defaults, not the user's choice, so before the
+  // first sync it cannot know whether local history is allowed at all.
+  context._retentionSettingsSynced = false;
+
+  await context._ensureAnalyticsHistoryBackfilled();
+
+  assert.equal(scans, 0, "an unsynced retention setting must not be read as consent");
+});
+
+test("history is not reconstructed while local history is turned off", async () => {
+  let scans = 0;
+  const context = createContext(() => {
+    scans += 1;
+    return completeBatch({ nextCursor: 10 });
+  });
+  // The live dictation path skips both the transcript and its counter when this
+  // is off (audioManager.saveTranscription). Mining the transcripts already on
+  // disk for counters would record exactly what the user turned off.
+  context._retentionSettings = { dataRetentionEnabled: false };
+
+  await context._ensureAnalyticsHistoryBackfilled();
+
+  assert.equal(scans, 0, "reconstruction must honour the gate the live path honours");
+});
 
 test("a failed history pass is absorbed and remains retryable", async () => {
   let attempts = 0;

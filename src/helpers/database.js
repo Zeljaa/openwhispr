@@ -6,6 +6,11 @@ const debugLogger = require("./debugLogger");
 const { buildNoteSearchQuery } = require("./noteSearch");
 const { normalizeStoredSpeakerCount } = require("./speakerCount");
 const { parseEventTime } = require("./calendarAvailability");
+// An explicit zone marks an instant this app captured at dictation time. A
+// naive timestamp may instead be a sync artifact: upsertTranscriptionFromCloud
+// keeps the cloud created_at but lets timestamp default to the local pull, so
+// a naive value must never outrank created_at when dating a historical row.
+const { hasExplicitTimeZone, parseDbTimestamp } = require("./dbTimestamp");
 const {
   ANALYTICS_COUNTER_VERSION,
   ANALYTICS_HISTORY_BACKFILL_VERSION,
@@ -117,29 +122,6 @@ const SELECTED_CALENDAR_EVENT_FILTER = `(
     SELECT 1 FROM apple_calendars WHERE apple_calendars.id = calendar_events.calendar_id
   ))
 )`;
-
-// SQLite's CURRENT_TIMESTAMP carries no zone designator and the ECMAScript
-// parser reads that form as local time, so the naive form is pinned to UTC
-// before parsing. Returns null for anything unreadable.
-function parseAnalyticsTimestamp(value) {
-  if (typeof value !== "string" || value.trim().length === 0) return null;
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)
-    ? `${value.replace(" ", "T")}Z`
-    : value;
-  const parsed = new Date(normalized);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
-}
-
-// An explicit zone marks an instant this app captured at dictation time. A
-// naive timestamp may instead be a sync artifact: upsertTranscriptionFromCloud
-// keeps the cloud created_at but lets timestamp default to the local pull, so
-// a naive value must never outrank created_at when dating a historical row.
-function hasExplicitAnalyticsTimestamp(value) {
-  return (
-    typeof value === "string" &&
-    (value.trim().endsWith("Z") || /[+-]\d{2}:\d{2}$/.test(value.trim()))
-  );
-}
 
 class DatabaseManager {
   constructor() {
@@ -1315,7 +1297,7 @@ class DatabaseManager {
       // continue to sort chronologically, while the trailing Z marks this as
       // an exact client-captured instant for clear-state reconciliation.
       const occurredAt =
-        parseAnalyticsTimestamp(analyticsOccurredAt)?.toISOString().replace("T", " ") ?? null;
+        parseDbTimestamp(analyticsOccurredAt)?.toISOString().replace("T", " ") ?? null;
       const stmt = this.db.prepare(
         `INSERT INTO transcriptions (
            text, raw_text, status, error_message, error_code, route_kind,
@@ -1514,14 +1496,13 @@ class DatabaseManager {
             continue;
           }
 
-          const createdAt = parseAnalyticsTimestamp(row.created_at);
+          const createdAt = parseDbTimestamp(row.created_at);
           // A naive timestamp can be a sync artifact rather than an occurrence
           // time, so it is never the answer: created_at carries the cloud row's
           // own instant, while timestamp defaulted to the moment of the pull.
           const occurredAt =
-            (hasExplicitAnalyticsTimestamp(row.timestamp)
-              ? parseAnalyticsTimestamp(row.timestamp)
-              : null) ?? createdAt;
+            (hasExplicitTimeZone(row.timestamp) ? parseDbTimestamp(row.timestamp) : null) ??
+            createdAt;
           // Guessing a date would put an old dictation on today, inflating
           // today's counters and manufacturing a current streak out of a row
           // whose age we could not read. It stays out instead.
@@ -2113,19 +2094,8 @@ class DatabaseManager {
   getTranscriptionById(id) {
     try {
       if (!this.db) throw new Error("Database not initialized");
-      const stmt = this.db.prepare(
-        `SELECT transcription.*,
-                EXISTS (
-                  SELECT 1 FROM analytics_events event
-                  WHERE event.event_id = transcription.client_transcription_id
-                    AND event.account_id = ?
-                    AND event.deleted_at IS NULL
-                    AND event.counter_version >= 1
-                ) AS exact_analytics_event_present
-         FROM transcriptions transcription
-         WHERE transcription.id = ?`
-      );
-      return stmt.get(this.activeAccountId, id) || null;
+      const stmt = this.db.prepare("SELECT * FROM transcriptions WHERE id = ?");
+      return stmt.get(id) || null;
     } catch (error) {
       debugLogger.error("Error getting transcription by id", { error: error.message }, "database");
       throw error;
@@ -6872,19 +6842,9 @@ class DatabaseManager {
       if (!this.db) throw new Error("Database not initialized");
       return this.db
         .prepare(
-          `SELECT transcription.*,
-                  EXISTS (
-                    SELECT 1 FROM analytics_events event
-                    WHERE event.event_id = transcription.client_transcription_id
-                      AND event.account_id = ?
-                      AND event.deleted_at IS NULL
-                      AND event.counter_version >= 1
-                  ) AS exact_analytics_event_present
-           FROM transcriptions transcription
-           WHERE transcription.sync_status = 'pending'
-             AND transcription.deleted_at IS NULL`
+          "SELECT * FROM transcriptions WHERE sync_status = 'pending' AND deleted_at IS NULL"
         )
-        .all(this.activeAccountId);
+        .all();
     } catch (error) {
       debugLogger.error(
         "Error getting pending transcriptions",
@@ -6948,9 +6908,15 @@ class DatabaseManager {
       const text = cloudTranscription.text ?? "";
       const rawText = cloudTranscription.raw_text || null;
       const status = cloudTranscription.status || "completed";
+      // timestamp is what the history list sorts and groups on, so it takes the
+      // cloud row's own instant rather than defaulting to the moment of the
+      // pull -- which would land a whole archive at "now", above everything
+      // spoken since. Deliberately not in the conflict update: a row this
+      // device recorded already carries the recording's start time, which is
+      // more precise than the cloud's creation time for the same dictation.
       const stmt = this.db.prepare(`
-        INSERT INTO transcriptions (client_transcription_id, cloud_id, text, raw_text, status, sync_status, created_at)
-        VALUES (?, ?, ?, ?, ?, 'synced', ?)
+        INSERT INTO transcriptions (client_transcription_id, cloud_id, text, raw_text, status, sync_status, created_at, timestamp)
+        VALUES (?, ?, ?, ?, ?, 'synced', ?, COALESCE(?, CURRENT_TIMESTAMP))
         ON CONFLICT(client_transcription_id) DO UPDATE SET
           cloud_id = excluded.cloud_id,
           text = excluded.text,
@@ -6977,7 +6943,8 @@ class DatabaseManager {
           text,
           rawText,
           status,
-          cloudTranscription.created_at
+          cloudTranscription.created_at,
+          cloudTranscription.created_at ?? null
         );
         return this.db
           .prepare("SELECT * FROM transcriptions WHERE client_transcription_id = ?")

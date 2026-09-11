@@ -666,9 +666,6 @@ class IPCHandlers {
     this._setupRetentionCleanup();
     this._logDetectedGpus();
     this.setupHandlers();
-    setImmediate(() => {
-      void this._ensureAnalyticsHistoryBackfilled();
-    });
     // Lives for the app's lifetime; IPCHandlers has no teardown path.
     tokenStore.subscribe(({ generation, token }) => {
       this.enterpriseIdentityManager?.clear();
@@ -705,11 +702,21 @@ class IPCHandlers {
     }
   }
 
+  // Reconstructing counters from the transcripts already on disk records exactly
+  // what "keep local history" turns off, so it answers to the same switch the
+  // live path checks in audioManager.saveTranscription. The main process boots
+  // with defaults rather than the user's choice, so an unsynced setting is not
+  // consent either -- the renderer's first sync is what starts this (#1370).
+  _canReconstructAnalyticsHistory() {
+    return this._retentionSettingsSynced && this._retentionSettings.dataRetentionEnabled;
+  }
+
   // Reconciliation is best-effort. Analytics reads await it so later-eligible
   // history shows up before the numbers are read, which means a failure here
   // must never fail the read itself: a broken scan would otherwise blank an
   // Insights summary that SQLite could have answered perfectly well.
   async _ensureAnalyticsHistoryBackfilled() {
+    if (!this._canReconstructAnalyticsHistory()) return { inserted: 0, scanned: 0 };
     if (this._analyticsHistoryBackfillPromise) return this._analyticsHistoryBackfillPromise;
     // The failure is absorbed inside this promise rather than around the
     // creator's await, because callers that join an in-flight pass are handed
@@ -1698,6 +1705,10 @@ class IPCHandlers {
           this._retentionSettings = settings;
           this._retentionSettingsSynced = true;
           this._runRetentionCleanup();
+          // First point at which the local-history switch is known to be real.
+          // After the sweep, so expired transcripts are gone before they can be
+          // reconstructed into counters the sweep would only have to purge.
+          void this._ensureAnalyticsHistoryBackfilled();
         },
       })
     );

@@ -159,7 +159,6 @@ export interface TranscriptionItem {
   cloud_id: string | null;
   sync_status: "synced" | "pending" | "error";
   deleted_at: string | null;
-  exact_analytics_event_present?: number;
 }
 
 export type AnalyticsMode = "local" | "openwhispr_cloud" | "byok" | "self_hosted" | "unknown";
@@ -1321,6 +1320,7 @@ declare global {
       syncRetentionSettings?: (settings: {
         audioRetentionDays: number;
         transcriptRetentionDays: number;
+        dataRetentionEnabled: boolean;
       }) => void;
       retryTranscription: (
         id: number,
